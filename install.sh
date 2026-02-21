@@ -90,23 +90,75 @@ confirm_action() {
 }
 
 # -----------------------------------------------------------------------------
-# Disk selection
+# Disk selection (multiple choice menu)
 # -----------------------------------------------------------------------------
 
 select_disk() {
-    log_info "Available disks:"
-    echo ""
-    lsblk -d -o NAME,SIZE,MODEL,TRAN | grep -E "^(NAME|sd|nvme|vd)"
-    echo ""
+    local disks=()
+    local disk_info=()
+    local i=0
 
-    local disk
-    read -r -p "Enter target disk (e.g., /dev/sda or /dev/nvme0n1): " disk
+    # Build array of available disks (exclude loop, rom, and the live USB)
+    while IFS= read -r line; do
+        local name size model tran
+        name=$(echo "$line" | awk '{print $1}')
+        size=$(echo "$line" | awk '{print $2}')
+        model=$(echo "$line" | awk '{print $3}')
+        tran=$(echo "$line" | awk '{print $4}')
 
-    if [[ ! "$disk" =~ ^/dev/ ]]; then
-        disk="/dev/${disk}"
+        # Skip if this disk contains the running system
+        if findmnt -n -o SOURCE / 2>/dev/null | grep -q "^/dev/${name}"; then
+            continue
+        fi
+
+        disks+=("/dev/${name}")
+        disk_info+=("${size} ${model:-unknown} [${tran:-?}]")
+        ((i++))
+    done < <(lsblk -d -n -o NAME,SIZE,MODEL,TRAN | grep -E "^(sd|nvme|vd|hd)")
+
+    if [[ ${#disks[@]} -eq 0 ]]; then
+        die "No suitable disks found"
     fi
 
-    echo "$disk"
+    echo ""
+    echo "============================================================"
+    log_info "Available disks for installation:"
+    echo "============================================================"
+    echo ""
+
+    # Display numbered menu
+    for i in "${!disks[@]}"; do
+        printf "  %d) %-15s %s\n" "$((i + 1))" "${disks[$i]}" "${disk_info[$i]}"
+    done
+    echo ""
+
+    local selection
+    while true; do
+        log_prompt "Select target disk [1-${#disks[@]}]:"
+        read -r -p "> " selection
+
+        # Validate input is a number
+        if [[ ! "$selection" =~ ^[0-9]+$ ]]; then
+            log_error "Please enter a number between 1 and ${#disks[@]}"
+            continue
+        fi
+
+        # Validate range
+        if [[ "$selection" -lt 1 || "$selection" -gt "${#disks[@]}" ]]; then
+            log_error "Please enter a number between 1 and ${#disks[@]}"
+            continue
+        fi
+
+        break
+    done
+
+    local selected_disk="${disks[$((selection - 1))]}"
+    local selected_info="${disk_info[$((selection - 1))]}"
+
+    echo ""
+    log_info "Selected: ${selected_disk} (${selected_info})"
+
+    echo "$selected_disk"
 }
 
 # -----------------------------------------------------------------------------
@@ -130,34 +182,95 @@ configure_layout() {
     echo "The EFI partition (512MB) will be created automatically."
     echo ""
 
-    # Ask about swap
-    log_prompt "Do you want a swap partition? (y/n)"
-    read -r -p "> " swap_choice
-    if [[ "$swap_choice" =~ ^[Yy] ]]; then
-        USE_SWAP="yes"
-        echo ""
-        log_prompt "Enter swap size (e.g., 8G, 16G, or 'ram' for RAM size):"
-        read -r -p "> " SWAP_SIZE
-        if [[ "$SWAP_SIZE" == "ram" ]]; then
-            local ram_kb
-            ram_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-            SWAP_SIZE="$((ram_kb / 1024 / 1024 + 1))G"
-            log_info "Using RAM size for swap: ${SWAP_SIZE}"
-        fi
+    # Calculate RAM for swap suggestions
+    local ram_kb ram_gb
+    ram_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    ram_gb=$((ram_kb / 1024 / 1024))
+    if [[ $ram_gb -eq 0 ]]; then ram_gb=1; fi
+
+    # Ask about swap with menu
+    echo ""
+    log_prompt "Configure swap partition:"
+    echo ""
+    echo "  1) No swap"
+    echo "  2) ${ram_gb}G  - Match RAM size (recommended for hibernation)"
+    echo "  3) $((ram_gb / 2))G  - Half RAM size"
+    echo "  4) Custom size"
+    echo ""
+
+    local swap_choice
+    while true; do
+        read -r -p "Enter choice [1-4, default=2]: " swap_choice
+        swap_choice="${swap_choice:-2}"
+
+        case "$swap_choice" in
+            1)
+                USE_SWAP="no"
+                break
+                ;;
+            2)
+                USE_SWAP="yes"
+                SWAP_SIZE="${ram_gb}G"
+                break
+                ;;
+            3)
+                USE_SWAP="yes"
+                local half_ram=$((ram_gb / 2))
+                if [[ $half_ram -eq 0 ]]; then half_ram=1; fi
+                SWAP_SIZE="${half_ram}G"
+                break
+                ;;
+            4)
+                USE_SWAP="yes"
+                echo ""
+                while true; do
+                    log_prompt "Enter swap size in GB (e.g., 8, 16, 32):"
+                    read -r -p "> " SWAP_SIZE
+                    # Validate it's a number
+                    if [[ "$SWAP_SIZE" =~ ^[0-9]+$ ]] && [[ "$SWAP_SIZE" -gt 0 ]]; then
+                        SWAP_SIZE="${SWAP_SIZE}G"
+                        break
+                    else
+                        log_error "Please enter a positive number (size in GB)"
+                    fi
+                done
+                break
+                ;;
+            *)
+                log_error "Please enter 1, 2, 3, or 4"
+                ;;
+        esac
+    done
+
+    if [[ "$USE_SWAP" == "yes" ]]; then
+        log_info "Swap size: ${SWAP_SIZE}"
+    else
+        log_info "Swap: disabled"
     fi
 
-    # Ask about filesystem
+    # Ask about filesystem with proper menu
     echo ""
     log_prompt "Select root filesystem:"
-    echo "  1) ext4 (recommended, stable)"
-    echo "  2) btrfs (snapshots, compression)"
-    echo "  3) xfs (performance)"
-    read -r -p "> " fs_choice
-    case "$fs_choice" in
-        2) ROOT_FS="btrfs" ;;
-        3) ROOT_FS="xfs" ;;
-        *) ROOT_FS="ext4" ;;
-    esac
+    echo ""
+    echo "  1) ext4   - Stable, well-tested, recommended for most users"
+    echo "  2) btrfs  - Snapshots, compression, CoW (good for NixOS rollbacks)"
+    echo "  3) xfs    - High performance, good for large files"
+    echo ""
+
+    local fs_choice
+    while true; do
+        read -r -p "Enter choice [1-3, default=1]: " fs_choice
+        fs_choice="${fs_choice:-1}"
+
+        case "$fs_choice" in
+            1) ROOT_FS="ext4"; break ;;
+            2) ROOT_FS="btrfs"; break ;;
+            3) ROOT_FS="xfs"; break ;;
+            *)
+                log_error "Please enter 1, 2, or 3"
+                ;;
+        esac
+    done
 
     # Show summary
     echo ""
@@ -190,30 +303,147 @@ collect_system_config() {
         HOSTNAME="nixos"
     fi
 
-    # Timezone
+    # Timezone with common options menu
     echo ""
-    log_prompt "Enter timezone (e.g., America/New_York, Europe/London, Asia/Tokyo):"
-    echo "  Tip: Run 'timedatectl list-timezones' to see all options"
-    read -r -p "> " TIMEZONE
-    if [[ -z "$TIMEZONE" ]]; then
-        TIMEZONE="UTC"
-    fi
+    log_prompt "Select timezone:"
+    echo ""
+    echo "  1) America/New_York      (US Eastern)"
+    echo "  2) America/Chicago       (US Central)"
+    echo "  3) America/Denver        (US Mountain)"
+    echo "  4) America/Los_Angeles   (US Pacific)"
+    echo "  5) Europe/London         (UK)"
+    echo "  6) Europe/Berlin         (Central Europe)"
+    echo "  7) Europe/Paris          (France)"
+    echo "  8) Asia/Tokyo            (Japan)"
+    echo "  9) Asia/Shanghai         (China)"
+    echo " 10) Australia/Sydney      (Australia)"
+    echo " 11) UTC"
+    echo " 12) Other (enter manually)"
+    echo ""
 
-    # Locale
-    echo ""
-    log_prompt "Enter locale (e.g., en_US.UTF-8, de_DE.UTF-8, ja_JP.UTF-8):"
-    read -r -p "> " LOCALE
-    if [[ -z "$LOCALE" ]]; then
-        LOCALE="en_US.UTF-8"
-    fi
+    local tz_choice
+    while true; do
+        read -r -p "Enter choice [1-12]: " tz_choice
 
-    # Keyboard layout
+        case "$tz_choice" in
+            1)  TIMEZONE="America/New_York"; break ;;
+            2)  TIMEZONE="America/Chicago"; break ;;
+            3)  TIMEZONE="America/Denver"; break ;;
+            4)  TIMEZONE="America/Los_Angeles"; break ;;
+            5)  TIMEZONE="Europe/London"; break ;;
+            6)  TIMEZONE="Europe/Berlin"; break ;;
+            7)  TIMEZONE="Europe/Paris"; break ;;
+            8)  TIMEZONE="Asia/Tokyo"; break ;;
+            9)  TIMEZONE="Asia/Shanghai"; break ;;
+            10) TIMEZONE="Australia/Sydney"; break ;;
+            11) TIMEZONE="UTC"; break ;;
+            12)
+                echo ""
+                log_prompt "Enter timezone (e.g., Europe/Amsterdam, Asia/Singapore):"
+                echo "  Tip: Run 'timedatectl list-timezones | less' to see all"
+                read -r -p "> " TIMEZONE
+                if [[ -z "$TIMEZONE" ]]; then
+                    TIMEZONE="UTC"
+                fi
+                break
+                ;;
+            *)
+                log_error "Please enter a number between 1 and 12"
+                ;;
+        esac
+    done
+
+    # Locale with common options
     echo ""
-    log_prompt "Enter keyboard layout (e.g., us, de, uk, fr, jp):"
-    read -r -p "> " KEYBOARD
-    if [[ -z "$KEYBOARD" ]]; then
-        KEYBOARD="us"
-    fi
+    log_prompt "Select locale:"
+    echo ""
+    echo "  1) en_US.UTF-8  - English (US)"
+    echo "  2) en_GB.UTF-8  - English (UK)"
+    echo "  3) de_DE.UTF-8  - German"
+    echo "  4) fr_FR.UTF-8  - French"
+    echo "  5) es_ES.UTF-8  - Spanish"
+    echo "  6) it_IT.UTF-8  - Italian"
+    echo "  7) pt_BR.UTF-8  - Portuguese (Brazil)"
+    echo "  8) ja_JP.UTF-8  - Japanese"
+    echo "  9) zh_CN.UTF-8  - Chinese (Simplified)"
+    echo " 10) Other (enter manually)"
+    echo ""
+
+    local locale_choice
+    while true; do
+        read -r -p "Enter choice [1-10, default=1]: " locale_choice
+        locale_choice="${locale_choice:-1}"
+
+        case "$locale_choice" in
+            1)  LOCALE="en_US.UTF-8"; break ;;
+            2)  LOCALE="en_GB.UTF-8"; break ;;
+            3)  LOCALE="de_DE.UTF-8"; break ;;
+            4)  LOCALE="fr_FR.UTF-8"; break ;;
+            5)  LOCALE="es_ES.UTF-8"; break ;;
+            6)  LOCALE="it_IT.UTF-8"; break ;;
+            7)  LOCALE="pt_BR.UTF-8"; break ;;
+            8)  LOCALE="ja_JP.UTF-8"; break ;;
+            9)  LOCALE="zh_CN.UTF-8"; break ;;
+            10)
+                echo ""
+                log_prompt "Enter locale (e.g., nl_NL.UTF-8):"
+                read -r -p "> " LOCALE
+                if [[ -z "$LOCALE" ]]; then
+                    LOCALE="en_US.UTF-8"
+                fi
+                break
+                ;;
+            *)
+                log_error "Please enter a number between 1 and 10"
+                ;;
+        esac
+    done
+
+    # Keyboard layout with common options
+    echo ""
+    log_prompt "Select keyboard layout:"
+    echo ""
+    echo "  1) us     - US English (QWERTY)"
+    echo "  2) uk     - UK English"
+    echo "  3) de     - German (QWERTZ)"
+    echo "  4) fr     - French (AZERTY)"
+    echo "  5) es     - Spanish"
+    echo "  6) it     - Italian"
+    echo "  7) pt     - Portuguese"
+    echo "  8) ru     - Russian"
+    echo "  9) jp     - Japanese"
+    echo " 10) Other (enter manually)"
+    echo ""
+
+    local kb_choice
+    while true; do
+        read -r -p "Enter choice [1-10, default=1]: " kb_choice
+        kb_choice="${kb_choice:-1}"
+
+        case "$kb_choice" in
+            1)  KEYBOARD="us"; break ;;
+            2)  KEYBOARD="uk"; break ;;
+            3)  KEYBOARD="de"; break ;;
+            4)  KEYBOARD="fr"; break ;;
+            5)  KEYBOARD="es"; break ;;
+            6)  KEYBOARD="it"; break ;;
+            7)  KEYBOARD="pt"; break ;;
+            8)  KEYBOARD="ru"; break ;;
+            9)  KEYBOARD="jp"; break ;;
+            10)
+                echo ""
+                log_prompt "Enter keyboard layout code:"
+                read -r -p "> " KEYBOARD
+                if [[ -z "$KEYBOARD" ]]; then
+                    KEYBOARD="us"
+                fi
+                break
+                ;;
+            *)
+                log_error "Please enter a number between 1 and 10"
+                ;;
+        esac
+    done
 }
 
 # -----------------------------------------------------------------------------
@@ -331,18 +561,42 @@ partition_disk() {
         part_suffix="p"
     fi
 
+    # Verify disk is still accessible
+    if [[ ! -b "$disk" ]]; then
+        die "Disk ${disk} is no longer accessible"
+    fi
+
+    # Check if disk is mounted anywhere
+    if mount | grep -q "^${disk}"; then
+        die "Disk ${disk} or one of its partitions is currently mounted. Unmount first."
+    fi
+
     # Wipe existing partition table
-    wipefs -af "$disk"
+    log_info "Wiping existing partition table..."
+    if ! wipefs -af "$disk" 2>/dev/null; then
+        log_warn "wipefs failed, trying alternative method..."
+        dd if=/dev/zero of="$disk" bs=1M count=10 status=none 2>/dev/null || true
+    fi
 
     # Build partition commands based on layout
     if [[ "$USE_SWAP" == "yes" ]]; then
+        # Parse swap size (supports formats: 8G, 8g, 8GB, 8gb, 8)
+        local swap_gb
+        swap_gb=$(echo "$SWAP_SIZE" | sed -E 's/[Gg][Bb]?$//' | tr -cd '0-9')
+        if [[ -z "$swap_gb" || "$swap_gb" -eq 0 ]]; then
+            log_warn "Invalid swap size '$SWAP_SIZE', defaulting to 8GB"
+            swap_gb=8
+        fi
+
+        local swap_end_mb=$((512 + swap_gb * 1024))
+
         # EFI + Swap + Root
         parted -s "$disk" -- \
             mklabel gpt \
             mkpart ESP fat32 1MiB 513MiB \
             set 1 esp on \
-            mkpart swap 513MiB "$((512 + $(echo "$SWAP_SIZE" | sed 's/G//' | sed 's/g//') * 1024))MiB" \
-            mkpart root "$((512 + $(echo "$SWAP_SIZE" | sed 's/G//' | sed 's/g//') * 1024))MiB" 100%
+            mkpart swap 513MiB "${swap_end_mb}MiB" \
+            mkpart root "${swap_end_mb}MiB" 100%
     else
         # EFI + Root only
         parted -s "$disk" -- \

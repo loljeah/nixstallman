@@ -3,10 +3,10 @@
 # nixstallman - NixOS 25.11 UEFI installer with LUKS encryption
 # Run from NixOS live ISO (pure bash)
 #
-# Usage: ./install.sh [config-url] [target-disk]
+# Usage: ./install.sh [target-disk]
 #
 # Example:
-#   ./install.sh https://github.com/user/nixos-config/archive/main.tar.gz /dev/nvme0n1
+#   ./install.sh /dev/nvme0n1
 #
 
 set -euo pipefail
@@ -59,16 +59,6 @@ hash_password() {
 # Validation functions
 # -----------------------------------------------------------------------------
 
-validate_url() {
-    local url="$1"
-    if [[ ! "$url" =~ ^https:// ]]; then
-        die "Config URL must use HTTPS: $url"
-    fi
-    if ! curl --head --silent --fail --max-time 10 "$url" > /dev/null 2>&1; then
-        die "Cannot reach config URL: $url"
-    fi
-}
-
 validate_disk() {
     local disk="$1"
     if [[ ! -b "$disk" ]]; then
@@ -96,7 +86,6 @@ confirm_action() {
 select_disk() {
     local disks=()
     local disk_info=()
-    local i=0
 
     # Build array of available disks (exclude loop, rom, and the live USB)
     while IFS= read -r line; do
@@ -113,7 +102,6 @@ select_disk() {
 
         disks+=("/dev/${name}")
         disk_info+=("${size} ${model:-unknown} [${tran:-?}]")
-        ((i++))
     done < <(lsblk -d -n -o NAME,SIZE,MODEL,TRAN | grep -E "^(sd|nvme|vd|hd)")
 
     if [[ ${#disks[@]} -eq 0 ]]; then
@@ -697,39 +685,6 @@ mount_filesystems() {
 }
 
 # -----------------------------------------------------------------------------
-# Fetch configuration
-# -----------------------------------------------------------------------------
-
-fetch_config() {
-    local config_url="$1"
-    local config_dir="/mnt/etc/nixos"
-
-    log_info "Fetching NixOS configuration..."
-
-    mkdir -p "$config_dir"
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    trap 'rm -rf "$tmpdir"' RETURN
-
-    local archive="${tmpdir}/config.tar.gz"
-    curl -fsSL --max-time 120 -o "$archive" "$config_url"
-
-    tar -xf "$archive" -C "$tmpdir"
-
-    local extracted_dir
-    extracted_dir=$(find "$tmpdir" -mindepth 1 -maxdepth 1 -type d | head -1)
-
-    if [[ -d "$extracted_dir" ]]; then
-        cp -r "$extracted_dir"/* "$config_dir"/
-    else
-        cp -r "$tmpdir"/* "$config_dir"/
-    fi
-
-    log_info "Configuration fetched to ${config_dir}"
-}
-
-# -----------------------------------------------------------------------------
 # Generate hardware configuration
 # -----------------------------------------------------------------------------
 
@@ -757,26 +712,13 @@ EOF
 }
 
 # -----------------------------------------------------------------------------
-# Generate base configuration (if remote config doesn't have one)
+# Generate base configuration
 # -----------------------------------------------------------------------------
 
 generate_base_config() {
     local config_file="/mnt/etc/nixos/configuration.nix"
 
-    # Only generate if no configuration.nix exists
-    if [[ -f "$config_file" ]]; then
-        log_info "Using fetched configuration.nix"
-
-        # Patch existing config with our settings if needed
-        # Check if it imports hardware-configuration.nix
-        if ! grep -q "hardware-configuration.nix" "$config_file"; then
-            log_warn "Adding hardware-configuration.nix import to existing config"
-            sed -i '1a\  imports = [ ./hardware-configuration.nix ];' "$config_file"
-        fi
-        return
-    fi
-
-    log_info "Generating base configuration.nix..."
+    log_info "Generating configuration.nix..."
 
     cat > "$config_file" << EOF
 { config, pkgs, ... }:
@@ -842,49 +784,6 @@ generate_base_config() {
 EOF
 
     log_info "Base configuration generated"
-}
-
-# -----------------------------------------------------------------------------
-# Apply user password to fetched config
-# -----------------------------------------------------------------------------
-
-apply_user_to_config() {
-    local config_file="/mnt/etc/nixos/configuration.nix"
-
-    if [[ ! -f "$config_file" ]]; then
-        return
-    fi
-
-    # Check if user is already defined
-    if grep -q "users.users.${USERNAME}" "$config_file"; then
-        log_info "User ${USERNAME} already in config, updating password hash..."
-
-        # Generate password hash
-        local pw_hash
-        pw_hash=$(hash_password "$USER_PASSWORD")
-
-        # Try to update initialHashedPassword if it exists
-        if grep -q "initialHashedPassword" "$config_file"; then
-            sed -i "s|initialHashedPassword = \"[^\"]*\"|initialHashedPassword = \"${pw_hash}\"|" "$config_file"
-        fi
-    else
-        log_info "Adding user ${USERNAME} to configuration..."
-
-        local pw_hash
-        pw_hash=$(hash_password "$USER_PASSWORD")
-
-        # Insert user block before the closing brace
-        sed -i "/^}$/i\\
-  # User added by nixstallman\\
-  users.users.${USERNAME} = {\\
-    isNormalUser = true;\\
-    extraGroups = [ \"wheel\" \"networkmanager\" ];\\
-    initialHashedPassword = \"${pw_hash}\";\\
-  };" "$config_file"
-    fi
-
-    # Clear password from memory
-    USER_PASSWORD=""
 }
 
 # -----------------------------------------------------------------------------
@@ -959,21 +858,7 @@ main() {
         die "This script must be run from a NixOS live environment"
     fi
 
-    local config_url="${1:-}"
-    local target_disk="${2:-}"
-
-    # Get config URL
-    if [[ -z "$config_url" ]]; then
-        echo "Enter the URL to your NixOS configuration tarball."
-        echo "Example: https://github.com/user/repo/archive/main.tar.gz"
-        echo ""
-        read -r -p "Config URL: " config_url
-    fi
-
-    if [[ -z "$config_url" ]]; then
-        die "Config URL is required"
-    fi
-    validate_url "$config_url"
+    local target_disk="${1:-}"
 
     # Get target disk
     if [[ -z "$target_disk" ]]; then
@@ -1005,7 +890,6 @@ main() {
     else
         echo "  Swap:           none"
     fi
-    echo "  Config URL:     ${config_url}"
     echo ""
 
     log_warn "This will DESTROY ALL DATA on ${target_disk}"
@@ -1020,10 +904,8 @@ main() {
     local luks_part="${part_info##*:}"
 
     mount_filesystems "$efi_part"
-    fetch_config "$config_url"
     generate_hardware_config "$luks_part"
     generate_base_config
-    apply_user_to_config
     install_nixos
     show_post_install
 }

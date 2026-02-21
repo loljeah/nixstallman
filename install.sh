@@ -3,10 +3,12 @@
 # nixstallman - NixOS 25.11 UEFI installer with LUKS encryption
 # Run from NixOS live ISO (pure bash)
 #
-# Usage: ./install.sh [target-disk]
+# Usage: ./install.sh [config-url] [target-disk]
 #
-# Example:
-#   ./install.sh /dev/nvme0n1
+# Examples:
+#   ./install.sh                                    # Interactive vanilla install
+#   ./install.sh "" /dev/nvme0n1                    # Vanilla install to specific disk
+#   ./install.sh https://github.com/user/nixos-config/archive/main.tar.gz /dev/nvme0n1
 #
 
 set -euo pipefail
@@ -35,6 +37,9 @@ TIMEZONE=""
 LOCALE=""
 KEYBOARD=""
 
+# Encryption
+LUKS_PASSPHRASE=""
+
 log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
@@ -59,6 +64,16 @@ hash_password() {
 # Validation functions
 # -----------------------------------------------------------------------------
 
+validate_url() {
+    local url="$1"
+    if [[ ! "$url" =~ ^https:// ]]; then
+        die "Config URL must use HTTPS: $url"
+    fi
+    if ! curl --head --silent --fail --max-time 10 "$url" > /dev/null 2>&1; then
+        die "Cannot reach config URL: $url"
+    fi
+}
+
 validate_disk() {
     local disk="$1"
     if [[ ! -b "$disk" ]]; then
@@ -80,73 +95,23 @@ confirm_action() {
 }
 
 # -----------------------------------------------------------------------------
-# Disk selection (multiple choice menu)
+# Disk selection
 # -----------------------------------------------------------------------------
 
 select_disk() {
-    local disks=()
-    local disk_info=()
+    log_info "Available disks:"
+    echo ""
+    lsblk -d -o NAME,SIZE,MODEL,TRAN | grep -E "^(NAME|sd|nvme|vd)"
+    echo ""
 
-    # Build array of available disks (exclude loop, rom, and the live USB)
-    while IFS= read -r line; do
-        local name size model tran
-        name=$(echo "$line" | awk '{print $1}')
-        size=$(echo "$line" | awk '{print $2}')
-        model=$(echo "$line" | awk '{print $3}')
-        tran=$(echo "$line" | awk '{print $4}')
+    local disk
+    read -r -p "Enter target disk (e.g., /dev/sda or /dev/nvme0n1): " disk
 
-        # Skip if this disk contains the running system
-        if findmnt -n -o SOURCE / 2>/dev/null | grep -q "^/dev/${name}"; then
-            continue
-        fi
-
-        disks+=("/dev/${name}")
-        disk_info+=("${size} ${model:-unknown} [${tran:-?}]")
-    done < <(lsblk -d -n -o NAME,SIZE,MODEL,TRAN | grep -E "^(sd|nvme|vd|hd)")
-
-    if [[ ${#disks[@]} -eq 0 ]]; then
-        die "No suitable disks found"
+    if [[ ! "$disk" =~ ^/dev/ ]]; then
+        disk="/dev/${disk}"
     fi
 
-    echo ""
-    echo "============================================================"
-    log_info "Available disks for installation:"
-    echo "============================================================"
-    echo ""
-
-    # Display numbered menu
-    for i in "${!disks[@]}"; do
-        printf "  %d) %-15s %s\n" "$((i + 1))" "${disks[$i]}" "${disk_info[$i]}"
-    done
-    echo ""
-
-    local selection
-    while true; do
-        log_prompt "Select target disk [1-${#disks[@]}]:"
-        read -r -p "> " selection
-
-        # Validate input is a number
-        if [[ ! "$selection" =~ ^[0-9]+$ ]]; then
-            log_error "Please enter a number between 1 and ${#disks[@]}"
-            continue
-        fi
-
-        # Validate range
-        if [[ "$selection" -lt 1 || "$selection" -gt "${#disks[@]}" ]]; then
-            log_error "Please enter a number between 1 and ${#disks[@]}"
-            continue
-        fi
-
-        break
-    done
-
-    local selected_disk="${disks[$((selection - 1))]}"
-    local selected_info="${disk_info[$((selection - 1))]}"
-
-    echo ""
-    log_info "Selected: ${selected_disk} (${selected_info})"
-
-    echo "$selected_disk"
+    echo "$disk"
 }
 
 # -----------------------------------------------------------------------------
@@ -170,95 +135,34 @@ configure_layout() {
     echo "The EFI partition (512MB) will be created automatically."
     echo ""
 
-    # Calculate RAM for swap suggestions
-    local ram_kb ram_gb
-    ram_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-    ram_gb=$((ram_kb / 1024 / 1024))
-    if [[ $ram_gb -eq 0 ]]; then ram_gb=1; fi
-
-    # Ask about swap with menu
-    echo ""
-    log_prompt "Configure swap partition:"
-    echo ""
-    echo "  1) No swap"
-    echo "  2) ${ram_gb}G  - Match RAM size (recommended for hibernation)"
-    echo "  3) $((ram_gb / 2))G  - Half RAM size"
-    echo "  4) Custom size"
-    echo ""
-
-    local swap_choice
-    while true; do
-        read -r -p "Enter choice [1-4, default=2]: " swap_choice
-        swap_choice="${swap_choice:-2}"
-
-        case "$swap_choice" in
-            1)
-                USE_SWAP="no"
-                break
-                ;;
-            2)
-                USE_SWAP="yes"
-                SWAP_SIZE="${ram_gb}G"
-                break
-                ;;
-            3)
-                USE_SWAP="yes"
-                local half_ram=$((ram_gb / 2))
-                if [[ $half_ram -eq 0 ]]; then half_ram=1; fi
-                SWAP_SIZE="${half_ram}G"
-                break
-                ;;
-            4)
-                USE_SWAP="yes"
-                echo ""
-                while true; do
-                    log_prompt "Enter swap size in GB (e.g., 8, 16, 32):"
-                    read -r -p "> " SWAP_SIZE
-                    # Validate it's a number
-                    if [[ "$SWAP_SIZE" =~ ^[0-9]+$ ]] && [[ "$SWAP_SIZE" -gt 0 ]]; then
-                        SWAP_SIZE="${SWAP_SIZE}G"
-                        break
-                    else
-                        log_error "Please enter a positive number (size in GB)"
-                    fi
-                done
-                break
-                ;;
-            *)
-                log_error "Please enter 1, 2, 3, or 4"
-                ;;
-        esac
-    done
-
-    if [[ "$USE_SWAP" == "yes" ]]; then
-        log_info "Swap size: ${SWAP_SIZE}"
-    else
-        log_info "Swap: disabled"
+    # Ask about swap
+    log_prompt "Do you want a swap partition? (y/n)"
+    read -r -p "> " swap_choice
+    if [[ "$swap_choice" =~ ^[Yy] ]]; then
+        USE_SWAP="yes"
+        echo ""
+        log_prompt "Enter swap size (e.g., 8G, 16G, or 'ram' for RAM size):"
+        read -r -p "> " SWAP_SIZE
+        if [[ "$SWAP_SIZE" == "ram" ]]; then
+            local ram_kb
+            ram_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+            SWAP_SIZE="$((ram_kb / 1024 / 1024 + 1))G"
+            log_info "Using RAM size for swap: ${SWAP_SIZE}"
+        fi
     fi
 
-    # Ask about filesystem with proper menu
+    # Ask about filesystem
     echo ""
     log_prompt "Select root filesystem:"
-    echo ""
-    echo "  1) ext4   - Stable, well-tested, recommended for most users"
-    echo "  2) btrfs  - Snapshots, compression, CoW (good for NixOS rollbacks)"
-    echo "  3) xfs    - High performance, good for large files"
-    echo ""
-
-    local fs_choice
-    while true; do
-        read -r -p "Enter choice [1-3, default=1]: " fs_choice
-        fs_choice="${fs_choice:-1}"
-
-        case "$fs_choice" in
-            1) ROOT_FS="ext4"; break ;;
-            2) ROOT_FS="btrfs"; break ;;
-            3) ROOT_FS="xfs"; break ;;
-            *)
-                log_error "Please enter 1, 2, or 3"
-                ;;
-        esac
-    done
+    echo "  1) ext4 (recommended, stable)"
+    echo "  2) btrfs (snapshots, compression)"
+    echo "  3) xfs (performance)"
+    read -r -p "> " fs_choice
+    case "$fs_choice" in
+        2) ROOT_FS="btrfs" ;;
+        3) ROOT_FS="xfs" ;;
+        *) ROOT_FS="ext4" ;;
+    esac
 
     # Show summary
     echo ""
@@ -291,147 +195,30 @@ collect_system_config() {
         HOSTNAME="nixos"
     fi
 
-    # Timezone with common options menu
+    # Timezone
     echo ""
-    log_prompt "Select timezone:"
-    echo ""
-    echo "  1) America/New_York      (US Eastern)"
-    echo "  2) America/Chicago       (US Central)"
-    echo "  3) America/Denver        (US Mountain)"
-    echo "  4) America/Los_Angeles   (US Pacific)"
-    echo "  5) Europe/London         (UK)"
-    echo "  6) Europe/Berlin         (Central Europe)"
-    echo "  7) Europe/Paris          (France)"
-    echo "  8) Asia/Tokyo            (Japan)"
-    echo "  9) Asia/Shanghai         (China)"
-    echo " 10) Australia/Sydney      (Australia)"
-    echo " 11) UTC"
-    echo " 12) Other (enter manually)"
-    echo ""
+    log_prompt "Enter timezone (e.g., America/New_York, Europe/London, Asia/Tokyo):"
+    echo "  Tip: Run 'timedatectl list-timezones' to see all options"
+    read -r -p "> " TIMEZONE
+    if [[ -z "$TIMEZONE" ]]; then
+        TIMEZONE="UTC"
+    fi
 
-    local tz_choice
-    while true; do
-        read -r -p "Enter choice [1-12]: " tz_choice
-
-        case "$tz_choice" in
-            1)  TIMEZONE="America/New_York"; break ;;
-            2)  TIMEZONE="America/Chicago"; break ;;
-            3)  TIMEZONE="America/Denver"; break ;;
-            4)  TIMEZONE="America/Los_Angeles"; break ;;
-            5)  TIMEZONE="Europe/London"; break ;;
-            6)  TIMEZONE="Europe/Berlin"; break ;;
-            7)  TIMEZONE="Europe/Paris"; break ;;
-            8)  TIMEZONE="Asia/Tokyo"; break ;;
-            9)  TIMEZONE="Asia/Shanghai"; break ;;
-            10) TIMEZONE="Australia/Sydney"; break ;;
-            11) TIMEZONE="UTC"; break ;;
-            12)
-                echo ""
-                log_prompt "Enter timezone (e.g., Europe/Amsterdam, Asia/Singapore):"
-                echo "  Tip: Run 'timedatectl list-timezones | less' to see all"
-                read -r -p "> " TIMEZONE
-                if [[ -z "$TIMEZONE" ]]; then
-                    TIMEZONE="UTC"
-                fi
-                break
-                ;;
-            *)
-                log_error "Please enter a number between 1 and 12"
-                ;;
-        esac
-    done
-
-    # Locale with common options
+    # Locale
     echo ""
-    log_prompt "Select locale:"
-    echo ""
-    echo "  1) en_US.UTF-8  - English (US)"
-    echo "  2) en_GB.UTF-8  - English (UK)"
-    echo "  3) de_DE.UTF-8  - German"
-    echo "  4) fr_FR.UTF-8  - French"
-    echo "  5) es_ES.UTF-8  - Spanish"
-    echo "  6) it_IT.UTF-8  - Italian"
-    echo "  7) pt_BR.UTF-8  - Portuguese (Brazil)"
-    echo "  8) ja_JP.UTF-8  - Japanese"
-    echo "  9) zh_CN.UTF-8  - Chinese (Simplified)"
-    echo " 10) Other (enter manually)"
-    echo ""
+    log_prompt "Enter locale (e.g., en_US.UTF-8, de_DE.UTF-8, ja_JP.UTF-8):"
+    read -r -p "> " LOCALE
+    if [[ -z "$LOCALE" ]]; then
+        LOCALE="en_US.UTF-8"
+    fi
 
-    local locale_choice
-    while true; do
-        read -r -p "Enter choice [1-10, default=1]: " locale_choice
-        locale_choice="${locale_choice:-1}"
-
-        case "$locale_choice" in
-            1)  LOCALE="en_US.UTF-8"; break ;;
-            2)  LOCALE="en_GB.UTF-8"; break ;;
-            3)  LOCALE="de_DE.UTF-8"; break ;;
-            4)  LOCALE="fr_FR.UTF-8"; break ;;
-            5)  LOCALE="es_ES.UTF-8"; break ;;
-            6)  LOCALE="it_IT.UTF-8"; break ;;
-            7)  LOCALE="pt_BR.UTF-8"; break ;;
-            8)  LOCALE="ja_JP.UTF-8"; break ;;
-            9)  LOCALE="zh_CN.UTF-8"; break ;;
-            10)
-                echo ""
-                log_prompt "Enter locale (e.g., nl_NL.UTF-8):"
-                read -r -p "> " LOCALE
-                if [[ -z "$LOCALE" ]]; then
-                    LOCALE="en_US.UTF-8"
-                fi
-                break
-                ;;
-            *)
-                log_error "Please enter a number between 1 and 10"
-                ;;
-        esac
-    done
-
-    # Keyboard layout with common options
+    # Keyboard layout
     echo ""
-    log_prompt "Select keyboard layout:"
-    echo ""
-    echo "  1) us     - US English (QWERTY)"
-    echo "  2) uk     - UK English"
-    echo "  3) de     - German (QWERTZ)"
-    echo "  4) fr     - French (AZERTY)"
-    echo "  5) es     - Spanish"
-    echo "  6) it     - Italian"
-    echo "  7) pt     - Portuguese"
-    echo "  8) ru     - Russian"
-    echo "  9) jp     - Japanese"
-    echo " 10) Other (enter manually)"
-    echo ""
-
-    local kb_choice
-    while true; do
-        read -r -p "Enter choice [1-10, default=1]: " kb_choice
-        kb_choice="${kb_choice:-1}"
-
-        case "$kb_choice" in
-            1)  KEYBOARD="us"; break ;;
-            2)  KEYBOARD="uk"; break ;;
-            3)  KEYBOARD="de"; break ;;
-            4)  KEYBOARD="fr"; break ;;
-            5)  KEYBOARD="es"; break ;;
-            6)  KEYBOARD="it"; break ;;
-            7)  KEYBOARD="pt"; break ;;
-            8)  KEYBOARD="ru"; break ;;
-            9)  KEYBOARD="jp"; break ;;
-            10)
-                echo ""
-                log_prompt "Enter keyboard layout code:"
-                read -r -p "> " KEYBOARD
-                if [[ -z "$KEYBOARD" ]]; then
-                    KEYBOARD="us"
-                fi
-                break
-                ;;
-            *)
-                log_error "Please enter a number between 1 and 10"
-                ;;
-        esac
-    done
+    log_prompt "Enter keyboard layout (e.g., us, de, uk, fr, jp):"
+    read -r -p "> " KEYBOARD
+    if [[ -z "$KEYBOARD" ]]; then
+        KEYBOARD="us"
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -549,42 +336,18 @@ partition_disk() {
         part_suffix="p"
     fi
 
-    # Verify disk is still accessible
-    if [[ ! -b "$disk" ]]; then
-        die "Disk ${disk} is no longer accessible"
-    fi
-
-    # Check if disk is mounted anywhere
-    if mount | grep -q "^${disk}"; then
-        die "Disk ${disk} or one of its partitions is currently mounted. Unmount first."
-    fi
-
     # Wipe existing partition table
-    log_info "Wiping existing partition table..."
-    if ! wipefs -af "$disk" 2>/dev/null; then
-        log_warn "wipefs failed, trying alternative method..."
-        dd if=/dev/zero of="$disk" bs=1M count=10 status=none 2>/dev/null || true
-    fi
+    wipefs -af "$disk"
 
     # Build partition commands based on layout
     if [[ "$USE_SWAP" == "yes" ]]; then
-        # Parse swap size (supports formats: 8G, 8g, 8GB, 8gb, 8)
-        local swap_gb
-        swap_gb=$(echo "$SWAP_SIZE" | sed -E 's/[Gg][Bb]?$//' | tr -cd '0-9')
-        if [[ -z "$swap_gb" || "$swap_gb" -eq 0 ]]; then
-            log_warn "Invalid swap size '$SWAP_SIZE', defaulting to 8GB"
-            swap_gb=8
-        fi
-
-        local swap_end_mb=$((512 + swap_gb * 1024))
-
         # EFI + Swap + Root
         parted -s "$disk" -- \
             mklabel gpt \
             mkpart ESP fat32 1MiB 513MiB \
             set 1 esp on \
-            mkpart swap 513MiB "${swap_end_mb}MiB" \
-            mkpart root "${swap_end_mb}MiB" 100%
+            mkpart swap 513MiB "$((512 + $(echo "$SWAP_SIZE" | sed 's/G//' | sed 's/g//') * 1024))MiB" \
+            mkpart root "$((512 + $(echo "$SWAP_SIZE" | sed 's/G//' | sed 's/g//') * 1024))MiB" 100%
     else
         # EFI + Root only
         parted -s "$disk" -- \
@@ -685,6 +448,39 @@ mount_filesystems() {
 }
 
 # -----------------------------------------------------------------------------
+# Fetch configuration
+# -----------------------------------------------------------------------------
+
+fetch_config() {
+    local config_url="$1"
+    local config_dir="/mnt/etc/nixos"
+
+    log_info "Fetching NixOS configuration..."
+
+    mkdir -p "$config_dir"
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' RETURN
+
+    local archive="${tmpdir}/config.tar.gz"
+    curl -fsSL --max-time 120 -o "$archive" "$config_url"
+
+    tar -xf "$archive" -C "$tmpdir"
+
+    local extracted_dir
+    extracted_dir=$(find "$tmpdir" -mindepth 1 -maxdepth 1 -type d | head -1)
+
+    if [[ -d "$extracted_dir" ]]; then
+        cp -r "$extracted_dir"/* "$config_dir"/
+    else
+        cp -r "$tmpdir"/* "$config_dir"/
+    fi
+
+    log_info "Configuration fetched to ${config_dir}"
+}
+
+# -----------------------------------------------------------------------------
 # Generate hardware configuration
 # -----------------------------------------------------------------------------
 
@@ -698,7 +494,13 @@ generate_hardware_config() {
     local luks_uuid
     luks_uuid=$(blkid -s UUID -o value "$luks_part")
 
-    cat >> /mnt/etc/nixos/hardware-configuration.nix << EOF
+    local hw_config="/mnt/etc/nixos/hardware-configuration.nix"
+
+    # Insert LUKS config before the closing brace
+    # Remove the final closing brace, add LUKS config, then add it back
+    sed -i '/^}$/d' "$hw_config"
+
+    cat >> "$hw_config" << EOF
 
   # LUKS encrypted root
   boot.initrd.luks.devices."cryptroot" = {
@@ -706,19 +508,37 @@ generate_hardware_config() {
     preLVM = true;
     allowDiscards = true;
   };
+}
 EOF
 
     log_info "Hardware configuration generated with LUKS UUID: ${luks_uuid}"
 }
 
 # -----------------------------------------------------------------------------
-# Generate base configuration
+# Generate base configuration (if remote config doesn't have one)
 # -----------------------------------------------------------------------------
 
 generate_base_config() {
     local config_file="/mnt/etc/nixos/configuration.nix"
 
-    log_info "Generating configuration.nix..."
+    # Only generate if no configuration.nix exists
+    if [[ -f "$config_file" ]]; then
+        log_info "Using fetched configuration.nix"
+
+        # Patch existing config with our settings if needed
+        # Check if it imports hardware-configuration.nix
+        if ! grep -q "hardware-configuration.nix" "$config_file"; then
+            log_warn "Adding hardware-configuration.nix import to existing config"
+            sed -i '1a\  imports = [ ./hardware-configuration.nix ];' "$config_file"
+        fi
+        return
+    fi
+
+    log_info "Generating base configuration.nix..."
+
+    # Hash password before writing config
+    local pw_hash
+    pw_hash=$(hash_password "$USER_PASSWORD")
 
     cat > "$config_file" << EOF
 { config, pkgs, ... }:
@@ -758,7 +578,7 @@ generate_base_config() {
     isNormalUser = true;
     description = "${USERNAME}";
     extraGroups = [ "wheel" "networkmanager" "video" "audio" ];
-    initialHashedPassword = "$(hash_password "$USER_PASSWORD")";
+    initialHashedPassword = "${pw_hash}";
   };
 
   # Allow unfree packages
@@ -784,6 +604,49 @@ generate_base_config() {
 EOF
 
     log_info "Base configuration generated"
+}
+
+# -----------------------------------------------------------------------------
+# Apply user password to fetched config
+# -----------------------------------------------------------------------------
+
+apply_user_to_config() {
+    local config_file="/mnt/etc/nixos/configuration.nix"
+
+    if [[ ! -f "$config_file" ]]; then
+        return
+    fi
+
+    # Check if user is already defined
+    if grep -q "users.users.${USERNAME}" "$config_file"; then
+        log_info "User ${USERNAME} already in config, updating password hash..."
+
+        # Generate password hash
+        local pw_hash
+        pw_hash=$(hash_password "$USER_PASSWORD")
+
+        # Try to update initialHashedPassword if it exists
+        if grep -q "initialHashedPassword" "$config_file"; then
+            sed -i "s|initialHashedPassword = \"[^\"]*\"|initialHashedPassword = \"${pw_hash}\"|" "$config_file"
+        fi
+    else
+        log_info "Adding user ${USERNAME} to configuration..."
+
+        local pw_hash
+        pw_hash=$(hash_password "$USER_PASSWORD")
+
+        # Insert user block before the closing brace
+        sed -i "/^}$/i\\
+  # User added by nixstallman\\
+  users.users.${USERNAME} = {\\
+    isNormalUser = true;\\
+    extraGroups = [ \"wheel\" \"networkmanager\" ];\\
+    initialHashedPassword = \"${pw_hash}\";\\
+  };" "$config_file"
+    fi
+
+    # Clear password from memory
+    USER_PASSWORD=""
 }
 
 # -----------------------------------------------------------------------------
@@ -858,7 +721,24 @@ main() {
         die "This script must be run from a NixOS live environment"
     fi
 
-    local target_disk="${1:-}"
+    local config_url="${1:-}"
+    local target_disk="${2:-}"
+
+    # Get config URL (optional - skip for vanilla install)
+    if [[ -z "$config_url" ]]; then
+        echo "Enter the URL to your NixOS configuration tarball."
+        echo "Example: https://github.com/user/repo/archive/main.tar.gz"
+        echo ""
+        echo -e "${CYAN}Press Enter to skip and use vanilla NixOS config.${NC}"
+        echo ""
+        read -r -p "Config URL (or blank for vanilla): " config_url
+    fi
+
+    if [[ -n "$config_url" ]]; then
+        validate_url "$config_url"
+    else
+        log_info "No config URL provided - will generate vanilla NixOS configuration"
+    fi
 
     # Get target disk
     if [[ -z "$target_disk" ]]; then
@@ -890,6 +770,11 @@ main() {
     else
         echo "  Swap:           none"
     fi
+    if [[ -n "$config_url" ]]; then
+        echo "  Config URL:     ${config_url}"
+    else
+        echo "  Config:         vanilla (generated)"
+    fi
     echo ""
 
     log_warn "This will DESTROY ALL DATA on ${target_disk}"
@@ -904,8 +789,14 @@ main() {
     local luks_part="${part_info##*:}"
 
     mount_filesystems "$efi_part"
+
+    if [[ -n "$config_url" ]]; then
+        fetch_config "$config_url"
+    fi
+
     generate_hardware_config "$luks_part"
     generate_base_config
+    apply_user_to_config
     install_nixos
     show_post_install
 }

@@ -242,10 +242,11 @@ nixos-generate-config --root /mnt
 # Get LUKS UUID
 LUKS_UUID=$(blkid -s UUID -o value "$LUKS_PART")
 
-# Add LUKS to hardware-configuration.nix
+# Add LUKS to hardware-configuration.nix (only if not already present)
 HW_CONF="/mnt/etc/nixos/hardware-configuration.nix"
-sed -i '/^}$/d' "$HW_CONF"
-cat >> "$HW_CONF" << EOF
+if ! grep -q "boot.initrd.luks.devices" "$HW_CONF"; then
+    sed -i '/^}$/d' "$HW_CONF"
+    cat >> "$HW_CONF" << EOF
 
   # LUKS
   boot.initrd.luks.devices."cryptroot" = {
@@ -254,6 +255,9 @@ cat >> "$HW_CONF" << EOF
   };
 }
 EOF
+else
+    log_info "LUKS config already present in hardware-configuration.nix"
+fi
 
 # Hash password
 PW_HASH=$(hash_password "$USER_PASS")

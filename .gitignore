@@ -1,3 +1,6 @@
+# Exam files (teachANDexam knowledge gate)
+exam_*.md
+
 # Secrets - never commit
 *.key
 *.pem
